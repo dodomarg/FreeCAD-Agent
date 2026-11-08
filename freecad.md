@@ -99,6 +99,32 @@ value back from the geometry datums and a margin row that goes negative on
 violation. Add clamp-status flags (`... ? 1 : 0`) so a silently clamped
 parameter is visible. Never let a limit be enforced only by your own arithmetic.
 
+**Snap new profiles to the closest existing edge (default preference).** When a
+feature adds to or cuts from an existing body, close its profile *on* the
+existing boundary rather than overlapping into the solid. Bring the boundary in
+as external geometry (the earlier sketch's edge, or a binder of the other
+body's sketch) and tie the new curve to it with `Equal` + concentric/coincident
+or `PointOnObject`, so it stays snapped when that edge moves. Examples: a
+screw tab closes on the plate's outer arc instead of starting 4 mm inside it; a
+wall rising from a plate starts on the plate top, not at the plate bottom; a
+lip hangs off a rib's face instead of being buried 1 mm in it; a feature that
+sits beside a bore uses the bore's own arc as its inner edge instead of a flat
+tangent line. Make neighbouring side faces coplanar on purpose (e.g. lip width =
+rib width) so they merge.
+
+- Overlapping profiles leave redundant seam edges and split faces on shared
+  planes (top/bottom faces of a plate become a patchwork). That is messy to
+  select, fragile for later attachments, and inflates face/edge counts.
+- Also set `Refine = True` on every PartDesign additive/subtractive feature you
+  create, so coplanar faces merge. Refine is the safety net, not the fix — still
+  snap the profile.
+- Overlap is acceptable only where an exact snap is unreliable (e.g. a refill
+  across raked/sheared pockets whose edges move through the thickness). Then
+  overlap deliberately, keep it small, and rely on Refine; say why in a comment
+  or the parameter description.
+- Verify: compare `len(shape.Faces)/len(shape.Edges)` with
+  `shape.removeSplitter()`; after a clean build they should be equal.
+
 ---
 
 ## Technique: tangential / non-normal pads onto curved bodies
@@ -275,6 +301,68 @@ features that were previously fine.
 and delete geometry in reverse index order. Inherited sketches often carry junk
 — e.g. a `Distance` constraint holding a dimensionless *ratio* as a length.
 
+**Verify which side a Pocket actually cut.** Pocket/Pad direction depends on
+the sketch normal and is easy to get backwards (e.g. a wire window meant for the
+top wall cutting the bottom wall instead). After every subtractive feature,
+confirm the removed volume is where intended — compare the before/after
+`BoundBox`, or `common()` the removed region with a probe box at the expected
+location — rather than trusting a valid status and a plausible volume.
+
+### Fillets and chamfers (OpenCASCADE limits)
+
+FreeCAD's kernel (OCCT) is far weaker at blends than Parasolid/ACIS-based CAD.
+Plan for it instead of fighting it.
+
+- **Fillet/chamfer last.** Put cosmetic dressups at the end of the tree and
+  never attach later sketches to the faces/edges they create.
+- **Edge references break on rebuild.** A dressup stores `EdgeN` names; any
+  upstream parameter change can renumber them (topological naming). For
+  parts with many dressed edges, select edges **by a geometric rule**
+  (position, direction, length, adjacent face type) in a small macro, e.g.
+  `Reselect_<Part>_Chamfer.FCMacro`, that rewrites `Base` in one pass. Run it
+  after every parameter change and as part of the stress test. Do not search
+  edge-by-edge with trial recomputes — it is slow and can hang the RPC server.
+- **Tangent-chain propagation cannot be turned off.** OCCT always extends a
+  fillet along tangent-continuous edges; there is no "tangent chain" toggle as
+  in Fusion/SolidWorks. If a fillet wanders onto edges you did not pick, break
+  the tangency in the geometry (a tiny step or angle) or model the round in the
+  sketch instead of as a dressup.
+- **Refine can hurt fillets.** If a fillet fails or drifts next to merged
+  faces, try `Refine = False` on the feature *before* the fillet. Re-verify
+  face/edge counts afterwards.
+- **Known OCCT bug — fillet ending on a cylinder seam when that cylindrical
+  face also has a hole** gives an invalid shape (still present in OCCT
+  8.1.0-dev). The fillet geometry looks right but `isValid()` is `False`.
+  Workaround: move the cylinder's seam away from the fillet's end vertex (e.g.
+  rotate the revolved/padded profile so its seam lies elsewhere, or build the
+  circle from two arcs), or move the hole off that face.
+- **Skip edges that will not blend** (thin-wall junctions, near-tangent
+  meetings) rather than forcing them, and report which ones were skipped.
+- Always check `feature.Shape.isValid()` after a dressup, and compare the
+  removed volume with the analytic expectation (≈ `r²(1 − π/4) × length` for a
+  90° fillet). A "valid" fillet that removes 1000× too much material is a
+  failure.
+
+### Keeping the RPC connection alive
+
+- **One command at a time.** Never run a long `execute_code_async` rebuild
+  while sending other commands; concurrent access can deadlock FreeCAD
+  (every thread waiting on a lock, RPC listen queue full). Run long rebuilds
+  synchronously, or wait for the async job to finish before anything else.
+- **A modal dialog blocks the RPC server.** If FreeCAD is idle but the RPC
+  does not answer, take an OS-level screenshot and look for a dialog — most
+  often **Document Recovery** at startup. Back up the recovery folders
+  (`~/.local/share/FreeCAD/.../recovery` or the AppImage/Flatpak equivalent)
+  before dismissing it; never discard them silently.
+- **If it deadlocks, restart and rebuild** — which only works if you kept a
+  build script and saved at milestones (see Working style).
+- Check how FreeCAD is installed (AppImage, Flatpak, distro package) before
+  touching its config, Mod or recovery folders; the paths differ.
+- **Do not hijack the user's live session.** Creating documents, switching the
+  active tab or running demos while the user is working in FreeCAD disrupts
+  them. Say what you will touch before doing it, use the user's document only
+  for the requested change, and stop if they say they are using FreeCAD.
+
 ## Assemblies (FreeCAD 1.0+ Assembly workbench)
 
 Assemblies fail for different reasons than parts do: not bad geometry, but
@@ -323,6 +411,176 @@ an under-constrained sketch.
 
 Source: <https://www.youtube.com/watch?v=GKkjTLQiqHM>
 
+## Five-part latch workflow: from bodies to a moving assembly
+
+Adapted from the user's notes on MangoJelly Solutions' "Learning FreeCAD For
+Beginners | 35 (Part 5)" and the preceding latch parts. This is a reusable
+modeling workflow, not an independently verified transcript of the video.
+
+### Part 1: primary body foundations and multi-plane sketching
+
+- Deconstruct the part into rectangles, circles, and tangent arcs before
+  building features. Sketch the main footprint on the XY origin plane and Pad
+  it to a spreadsheet-driven length.
+- Attach intersecting profiles to XZ or YZ origin planes, or to attached datum
+  planes. Use the same design origin and shared parameters to align profiles;
+  verify local-to-global axes rather than aligning by eye.
+- Establish functional geometry first. Defer cosmetic fillets and chamfers
+  until the end of the Body's feature tree so later sketches do not depend on
+  their transient edges. If a functional radius must come earlier, reference
+  stable datums rather than its generated edges.
+
+### Part 2: separate bodies and inter-part alignment
+
+- Create a separate `PartDesign::Body` for each separate solid component under
+  the project container. Confirm the active Body before creating a sketch or
+  feature; do not accidentally extend the first component.
+- Use a Shape Binder for broad reference geometry from another Body, and a
+  Sub-Shape Binder for selected faces, edges, or vertices. This is a scope
+  preference, not an exclusive capability distinction: both can reference
+  subelements. Choose the smallest useful reference set.
+- Locate mating holes and mounting faces from those references or shared
+  datums. Keep dependencies one-way; do not make two bodies depend on each
+  other's downstream features. Prefer common master geometry for shared intent.
+- Expose clearances as named spreadsheet inputs. A 0.2-0.4 mm gap can be a
+  starting point for some 3D-printed fits, not a universal tolerance. Specify
+  whether the value is per-side, radial, diametral, or axial, and calibrate for
+  process, material, print orientation, and intended fit. A per-side radial
+  clearance requires twice that allowance on the hole diameter.
+- Toggle visibility with Spacebar, use transparency or section views, and
+  measure gaps. Visual alignment alone does not establish adequate clearance.
+
+### Part 3: negative-space modeling and symmetry
+
+- Where simpler, Pad a solid blank and Pocket a master subtractive profile
+  instead of assembling many small additive features. This "reverse" modeling
+  strategy does not imply setting the Pocket's `Reversed` property: choose its
+  actual direction and extent from the material to remove.
+- Construct symmetric cutouts from a half-profile and the sketch origin axes.
+  Use construction centerlines and `Symmetric`, `Horizontal`, and `Vertical`
+  constraints as appropriate; ensure the final pocket profile is closed.
+- Use a PartDesign `Mirrored` feature about an origin or attached datum plane
+  for matching cuts on opposite sides rather than maintaining duplicate
+  sketches. Check that the result remains a valid single solid.
+
+### Part 4: hook and lever curvature with selective references
+
+- Break curved lever geometry into top-down and side-elevation profiles.
+  Use principal-plane sketches to control the silhouette and thickness with
+  normal PartDesign features instead of guessing free-space geometry.
+- Bring only required hinge, hole, or contact references into the active Body
+  with Sub-Shape Binders. Derive hole axes from suitable geometry or named
+  datums; do not assume every selected subelement exposes an axis.
+- Build smooth transitions with tangent lines/arcs and fully constrained
+  construction circles. Enforce tangency with constraints, not visual contact.
+- Pocket hinge-pin holes and final reliefs relative to the shared references,
+  with spreadsheet-driven clearances.
+
+### Part 5: mating, degrees of freedom, and travel checks
+
+- Inspect the installed FreeCAD version and assembly workbench before choosing
+  objects or APIs. Integrated Assembly uses solver-backed joints; Assembly4
+  primarily positions linked components through LCS attachments and expressions.
+  Do not treat their joint APIs, grounding, or motion controls as interchangeable.
+- Preserve source Bodies and insert components using the chosen workbench's
+  supported link/insertion workflow. A shared project tree is useful organization,
+  not a guarantee that drag-and-drop reparenting preserves references. Recheck
+  binders, attachments, expressions, and links after any container change.
+- Ground the primary base frame. Organize rigidly co-moving parts into
+  sub-assemblies as described above; do not accidentally freeze intended
+  internal motion inside a rigid group.
+- For a simple hinge, use a Revolute joint about a stable hinge datum, leaving
+  one relative rotational DoF and no axial translation. In mate-based systems,
+  concentric alignment alone usually leaves rotation and translation; add only
+  the axial location needed. Avoid stacking redundant concentric/plane mates
+  on a joint that already imposes them.
+- One DoF is the target for an isolated hinge, not every moving component or
+  every mechanism. Establish the intended mobility of the full linkage,
+  including coupling and limits; ground rigid parts and retain only the
+  intended independent motion. Sketches must still have zero DoF.
+- Drive or manually move the latch from closed to fully open using supported
+  joint or expression controls, recomputing and solving at each pose. Define
+  named travel-limit and clearance parameters; do not overwrite source Body
+  placements to fake motion.
+- Check interference throughout travel, not just at endpoints. Use workbench
+  clash tools when available, or analysis-only shape intersections and minimum
+  distances on valid solids in a common global frame. Include pins, retainers,
+  hook, housing, and lever; distinguish intended contact from penetration.
+- For sampled checks, record the tested range, step size, worst pose, minimum
+  measured gap, and any overlap volume against declared tolerances. Refine near
+  close approaches; a finite set of collision-free samples is not proof of a
+  collision-free continuous sweep. Restore the intended saved pose afterward.
+
+### Reference stability and completion checks
+
+- Prefer origin planes, attached datum planes, and purpose-built joint LCSs to
+  generated faces. Shape Binders and Sub-Shape Binders manage dependencies but
+  do not eliminate the topological naming problem: a binder or datum based on
+  a changing `FaceN`/`EdgeN` remains vulnerable. Minimize such references and
+  verify them after upstream edits, even with newer TNP mitigation.
+- Fully constrain every sketch, including construction geometry. Green
+  geometry is a useful GUI cue, but colors depend on the theme and selection;
+  require `sk.solve() == 0` and `sk.FullyConstrained is True`, not color alone.
+- Before manufacturing handoff, perturb representative driving dimensions
+  within the valid design range, recompute, and verify sketches, feature
+  validity, reference resolution, assembly mobility, and clearance. Restore the
+  intended values and pose, recompute, and save. Report the checks actually
+  performed and any motion or manufacturing validation still outstanding.
+
+## Technique: cross-section review plots (show the inside, with use-case overlays)
+
+A screenshot of a closed or extruded part usually shows only the end wall and
+none of the interior: cavities, wall thickness, floor slopes, voids or tiers. When
+a design's function lives in its profile (bins, organizers, ducts, housings,
+brackets, anything mostly extruded), check and communicate it with a **planar
+cross-section plotted to scale with matplotlib**, overlaid with the objects it
+must hold or clear.
+
+1. **Slice the real solid, not the sketches.** Take the Body tip shape after
+   recompute and validity checks, then cut it through a representative plane.
+   Pick the plane that shows the function: through a bay, not through a
+   divider; through a socket axis if the socket matters.
+   ```python
+   import json
+   ws = body.Tip.Shape.slice(App.Vector(1,0,0), 25.0)   # normal, offset
+   data = [[(p.y, p.z) for p in w.discretize(Deflection=0.05)] for w in ws]
+   json.dump(data, open('/home/e/.cache/section.json', 'w'))
+   ```
+   `slice()` returns closed wires; every wire becomes one filled polygon. An
+   enclosed void appears as its own wire. Draw it in a different colour, or
+   build `Part.Face(wires)` and plot the face if holes must render as holes.
+2. **Write the data where the shell can read it.** The FreeCAD AppImage may have
+   a private `/tmp`; a file written there from FreeCAD can be invisible to bash.
+   Use a path under the home directory (e.g. `~/.cache`), and delete it afterwards.
+3. **Plot to scale in a normal Python** (outside FreeCAD): `ax.set_aspect('equal')`,
+   real mm axes, `Agg` backend, `savefig` next to the model files.
+4. **Overlay the use case.** Draw the stored or mating objects as simple
+   primitives at their resting pose, derived from the same spreadsheet values:
+   e.g. a 140 mm tool as a thick line from its floor contact point at the tilt
+   angle, a clip as a rectangle, a hand-clearance envelope as a dashed box.
+   Add reference lines (board face, bed plane) and short labels for the key
+   measured values (inner depth, tier heights). This turns "looks right" into
+   a visible functional check: does the tool stay in, is it visible, does it
+   clash, is the clip reachable?
+5. **Review the image yourself before handing it over** (open it with `view`).
+   Typical catches: sliver walls, a floor sloping the wrong way, an
+   unsupported ceiling, an item resting on the wrong wall, a cavity that
+   failed to open at the top.
+6. **Pair it with numbers.** The plot is for understanding; the decision-relevant
+   values still come from spreadsheet check rows and analysis on the solid
+   (`isValid`, volume, bounding box, overhang/bed-contact scans).
+
+Overhang scan to go with the section (approximate: it uses each face's normal
+at its centre of mass, so it is only exact for planar faces):
+```python
+for i, f in enumerate(sh.Faces):
+    n = f.normalAt(*f.Surface.parameter(f.CenterOfMass))
+    if n.z < -0.7072 and f.BoundBox.ZMin > 0.01 and f.Area > 1:   # >45 deg, off the bed
+        print(i+1, f.Surface.__class__.__name__, round(f.Area,1), f.BoundBox)
+```
+Curved faces (bosses, holes with a horizontal axis) are flagged by centre
+normal even when mostly fine. Inspect their type and bounding box before acting.
+
 ## Working style
 
 - Prefer `execute_code` for everything structural; `create_object` is only
@@ -339,3 +597,35 @@ Source: <https://www.youtube.com/watch?v=GKkjTLQiqHM>
 - When a reference design supplies formulas, implement the formulas rather than
   transcribing their numeric results, then reproduce one of the reference's own
   worked examples as a validation check and report the agreement.
+- **Keep a build script.** For any non-trivial part, keep the construction as a
+  re-runnable Python script next to the `.FCStd` (`<Part>_build.py`) that
+  rebuilds the document from the spreadsheet down. It is your recovery path
+  after a crash or a broken tree, and documentation of intent. Save the
+  `.FCStd` after each verified milestone, not just at the end.
+- **Resolve geometry references unambiguously.** "Face 29" means nothing in a
+  multi-body document, and face numbers shift after every rebuild. Ask the
+  user to select it and press **Send Selection to MCP**, or to give the full
+  path (`Doc.Body.Feature.FaceN`), and check the face type (`Surface`
+  class, radius, area) matches what they describe before modelling on it.
+- **Never silently substitute a requested feature.** If the requested geometry
+  (e.g. a herringbone, a specific thread) is hard or conflicts with the
+  mechanism, say so and propose the alternative; do not quietly build
+  something simpler and present it as done.
+- **Model mating parts as dummies.** Put purchased or mating components (PCB,
+  module, motor, nut) in their own Body, driven by the same spreadsheet,
+  labelled `DUMMY_<name> (do not print)` and coloured distinctly. Use them for
+  interference and clearance checks; exclude them from export. Confirm their
+  real shape from a photo or datasheet before designing around them.
+- **Make fits explicit.** Define clearance and interference as separate named
+  cells (`rib_squeeze`, `tooth_interference`) rather than letting them fall out
+  of other numbers — a rib whose protrusion equals the clearance grips with
+  0 mm squeeze. Check overlaps numerically (`a.common(b).Volume`); then set
+  the interference to 0 and confirm the overlap disappears, proving every
+  overlap is the intended one.
+- **Threads for printing:** model them as a sketch-driven
+  `PartDesign::SubtractiveHelix` (or `AdditiveHelix`) with an ISO 60° profile,
+  pitch/length/depth in the spreadsheet; state that it is a modelled, printable
+  thread and recommend a test fit against a real nut/bolt.
+- **Stress-test before handover.** Change representative driving parameters,
+  recompute (and re-run any reselection macros), verify validity, then restore
+  the values and save.
